@@ -1,5 +1,8 @@
 const axios = require('axios');
 const cron = require('node-cron');
+const fs = require('fs');
+const path = require('path');
+const FormData = require('form-data');
 
 require('dotenv').config();
 
@@ -10,9 +13,7 @@ const PRIORITY_BASE_URL = process.env.PRIORITY_BASE_URL;
 const PRIORITY_USERNAME = process.env.PRIORITY_USERNAME;
 const PRIORITY_PAT = process.env.PRIORITY_PAT;
 
-// ============================================
-// STEP 1 - Get Shopify API Token
-// ============================================
+
 async function getShopifyToken() {
   const response = await axios.post(
     `https://${SHOPIFY_STORE}/admin/oauth/access_token`,
@@ -26,103 +27,105 @@ async function getShopifyToken() {
   return response.data.access_token;
 }
 
-
-const fs = require('fs');
-
 async function getPriorityProducts() {
+
   const response = await axios.get(
-    `${PRIORITY_BASE_URL}/PART`,
-    {
+    `${PRIORITY_BASE_URL}/LOGPART`,{
       auth: {
         username: PRIORITY_USERNAME,
         password: PRIORITY_PAT,
       },
       params: {
-      //  '$filter': "WEBLEVEL ge '1'",
-        '$filter': "PARTDES eq 'manaal'",
-        '$select': 'PARTNAME,PARTDES,EPARTDES,BARCODE,FAMILYNAME,STATDES,TYPE,WEBLEVEL',
-        '$expand': 'PARTTEXT_SUBFORM,PARTEXTFILE_SUBFORM,PARTTEXTLANG_SUBFORM',
-        '$top': 5
-      }
+        '$filter': "SHOWINWEB eq 'Y'",
+        '$select': 'PARTNAME, PARTDES, VATPRICE, FAMILYDES, ITMT_PARTTYPECODE, ITMT_PARTTYPEDES, ITMT_BALANCE, SPEC1, EXTFILENAME',
+        '$expand': 'PARTTEXT_SUBFORM,PARTEXTFILE_SUBFORM'
+       }
     }
   );
+
   console.log(JSON.stringify(response.data.value, null, 2));
   return response.data.value;
 }
 
-
-// ============================================
-// STEP 3 - Check if product exists in Shopify
-// ============================================
 async function getShopifyProductBySKU(token, sku) {
-  const response = await axios.get(
-    `https://${SHOPIFY_STORE}/admin/api/2026-04/products.json?fields=id,variants&limit=250`,
-    { headers: { 'X-Shopify-Access-Token': token } }
-  );
-  const products = response.data.products;
-  for (const product of products) {
-    for (const variant of product.variants) {
-      if (variant.sku === sku) return product.id;
-    }
+  try {
+    let page_info = null;
+    do {
+      const params = { limit: 250, fields: 'id,variants' };
+      if (page_info) params.page_info = page_info;
+
+      const res = await axios.get(
+        `https://${process.env.SHOPIFY_STORE}/admin/api/2026-04/products.json`,
+        { headers: { 'X-Shopify-Access-Token': token }, params }
+      );
+
+      for (const product of res.data.products) {
+        for (const variant of product.variants) {
+          if (variant.sku === sku) return { productId: product.id, variantId: variant.id };
+        }
+      }
+
+      // Check for next page
+      const linkHeader = res.headers['link'] || '';
+      const nextMatch = linkHeader.match(/<[^>]*page_info=([^&>]+)[^>]*>;\s*rel="next"/);
+      page_info = nextMatch ? nextMatch[1] : null;
+
+    } while (page_info);
+
+    return null;
+  } catch (err) {
+    console.error('❌ Error finding product by SKU:', err.message);
+    return null;
   }
-  return null;
 }
 
-// ============================================
-// STEP 4 - Push Products to Shopify
-// ============================================
-//async function pushToShopify(token, products) {
-//  const headers = {
-//    'X-Shopify-Access-Token': token,
-//    'Content-Type': 'application/json',
-//  };
-//
-//  for (const item of products) {
-//    const product = {
-//      product: {
-//        title: item.PARTDES,           // תאור מוצר
-//        body_html: `
-//          <p>${item.DETAILS || ''}</p>
-//          <p>${item.PARTTEXT || ''}</p>
-//          <p>${item.SPEC || ''}</p>
-//        `,                             // תאור + מוצרים טקסט + מידות
-//        product_type: item.FAMILYDES,  // תאור סוג פריט
-//        tags: [item.FAMILY, item.FAMILYNAME].filter(Boolean).join(','), // משפחת מוצר
-//        variants: [
-//          {
-//            sku: item.PARTNAME,        // מק"ט
-//            barcode: item.BARCODE,     // ברקוד
-//            price: item.VATPRICE || '0.00', // מחיר כולל מע"מ
-//          },
-//        ],
-//        images: item.IMAGE ? [{ src: item.IMAGE }] : [], // תמונה
-//      },
-//    };
-//
-//    try {
-//      const existingId = await getShopifyProductBySKU(token, item.PARTNAME);
-//
-//      if (existingId) {
-//        await axios.put(
-//          `https://${SHOPIFY_STORE}/admin/api/2026-04/products/${existingId}.json`,
-//          product,
-//          { headers }
-//        );
-//        console.log(`🔄 Updated: ${item.PARTDES}`);
-//      } else {
-//        await axios.post(
-//          `https://${SHOPIFY_STORE}/admin/api/2026-04/products.json`,
-//          product,
-//          { headers }
-//        );
-//        console.log(`✅ Created: ${item.PARTDES}`);
-//      }
-//    } catch (err) {
-//      console.error(`❌ Failed: ${item.PARTDES}`, err.response?.data);
-//    }
-//  }
-//}
+async function uploadBase64ImageToShopify(token, base64String, filename, productId) {
+  try {
+    // Remove data URI prefix if present (e.g. "data:image/jpeg;base64,")
+    const base64Data = base64String.replace(/^data:image\/\w+;base64,/, '');
 
+    // Convert base64 to buffer
+    const imageBuffer = Buffer.from(base64Data, 'base64');
+
+    // Save temporarily to disk
+    const tempPath = path.join('/tmp', filename);
+    fs.writeFileSync(tempPath, imageBuffer);
+
+    // Upload to Shopify using multipart form
+    const form = new FormData();
+    form.append('file', fs.createReadStream(tempPath), {
+      filename: filename,
+      contentType: 'image/jpeg',
+    });
+
+    const response = await axios.post(
+      `https://${process.env.SHOPIFY_STORE}/admin/api/2026-04/products/${productId}/images.json`,
+      {
+        image: {
+          attachment: base64Data,  // Shopify accepts base64 directly!
+          filename: filename,
+        }
+      },
+      {
+        headers: {
+          'X-Shopify-Access-Token': token,
+          'Content-Type': 'application/json',
+        }
+      }
+    );
+
+    console.log(`   🖼️ Image uploaded: ${response.data.image.src}`);
+
+    // Cleanup temp file
+    fs.unlinkSync(tempPath);
+
+    return response.data.image.src;
+
+  } catch (err) {
+    console.error('   ❌ Image upload failed:', err.response?.data || err.message);
+    return null;
+  }
+}
 
 async function pushToShopify(token, products) {
   const headers = {
@@ -130,66 +133,142 @@ async function pushToShopify(token, products) {
     'Content-Type': 'application/json',
   };
 
+  console.log(`\n🚀 Syncing ${products.length} products to Shopify...\n`);
+
   for (const item of products) {
-    // Extract text from PARTTEXT_SUBFORM
-    const partText = item.PARTTEXT_SUBFORM?.TEXT || '';
+    console.log(`📦 Processing: ${item.PARTDES} (SKU: ${item.PARTNAME})`);
+    console.log(`   💰 Price: ${item.VATPRICE}`);
+    console.log(`   📁 Family: ${item.FAMILYDES}`);
+    console.log(`   📦 Balance: ${item.ITMT_BALANCE}`);
+    console.log(`   🌐 ShowInWeb: ${item.SHOWINWEB}`);
+    console.log(`   📝 Description: ${item.PARTTEXT_SUBFORM?.TEXT || 'none'}`);
 
-    // Extract description from PARTTEXTLANG_SUBFORM
-    const partTextLang = item.PARTTEXTLANG_SUBFORM?.TEXT || '';
-
-    // Extract images from PARTEXTFILE_SUBFORM
-    const images = (item.PARTEXTFILE_SUBFORM || [])
-      .filter(f => f.EXTFILENAME && /\.(jpg|jpeg|png|gif|webp)/i.test(f.EXTFILENAME))
-      .map(f => ({ src: f.EXTFILENAME }));
-
-    const product = {
+    const productPayload = {
       product: {
-        title: item.PARTDES,                    // תאור מוצר
-        body_html: `
-          <p>${partTextLang || ''}</p>
-          <p>${partText || ''}</p>
-        `,                                      // תאור + טקסט מוצר
-        product_type: item.FAMILYNAME || '',    // משפחת מוצר
-        tags: [item.FAMILYNAME].filter(Boolean).join(','),
+        title: item.PARTDES || '',
+        // ✅ Insert description from PARTTEXT_SUBFORM
+        body_html: (() => {
+          const description = item.PARTTEXT_SUBFORM?.TEXT ? `<p>${item.PARTTEXT_SUBFORM.TEXT}</p>` : '';
+          const dimensions = item.SPEC1 ? `<p>מידות מוצר: ${item.SPEC1}</p>` : '';
+          return `${description}${dimensions}`;
+        })(),
+
+        product_type: item.FAMILYDES || item.ITMT_PARTTYPEDES || '',
+        tags: [item.FAMILYDES, item.ITMT_PARTTYPEDES].filter(Boolean).join(','),
         variants: [
           {
-            sku: item.PARTNAME,                 // מק"ט
-            barcode: item.BARCODE || '',        // ברקוד
-            price: String(item.VATPRICE || '0.00'), // מחיר כולל מע"מ
-          },
-        ],
-        images: images,                         // תמונות ממסמכים
-      },
+            sku: item.PARTNAME,
+            barcode: item.PARTNAME || '',  // ✅ Barcode = SKU
+            price: item.VATPRICE ? String(item.VATPRICE) : '0.00',
+            inventory_quantity: item.ITMT_BALANCE ? parseInt(item.ITMT_BALANCE) : 0,
+            // ✅ Track inventory if balance > 0
+            inventory_management: item.ITMT_BALANCE && parseInt(item.ITMT_BALANCE) > 0 ? 'shopify' : null,
+            inventory_policy: 'deny', // stop selling when out of stock
+          }
+        ],// ✅ Add SPEC1 as metafield
+         metafields: item.SPEC1 ? [
+           {
+             namespace: 'custom',
+             key: 'package_size',
+             value: item.SPEC1,
+             type: 'single_line_text_field',
+           }
+         ] : [],
+      }
     };
 
-    try {
-      const existingId = await getShopifyProductBySKU(token, item.PARTNAME);
+    let productId = null;
 
-      if (existingId) {
-        await axios.put(
-          `https://${SHOPIFY_STORE}/admin/api/2026-04/products/${existingId}.json`,
-          product,
+    try {
+      const existing = await getShopifyProductBySKU(token, item.PARTNAME);
+
+      if (existing) {
+        // UPDATE
+        const res = await axios.put(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2026-04/products/${existing.productId}.json`,
+          productPayload,
           { headers }
         );
-        console.log(`🔄 Updated: ${item.PARTDES}`);
+        productId = res.data.product.id;
+        console.log(`   🔄 Updated: ${item.PARTDES} (${productId})`);
       } else {
-        await axios.post(
-          `https://${SHOPIFY_STORE}/admin/api/2026-04/products.json`,
-          product,
+        // CREATE
+        const res = await axios.post(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2026-04/products.json`,
+          productPayload,
           { headers }
         );
-        console.log(`✅ Created: ${item.PARTDES}`);
+        productId = res.data.product.id;
+        console.log(`   ✅ Created: ${item.PARTDES} (${productId})`);
       }
+
     } catch (err) {
-      console.error(`❌ Failed: ${item.PARTDES}`, err.response?.data);
+      console.error(`   ❌ Failed: ${item.PARTDES}`);
+      console.error('   Status:', err.response?.status);
+      console.error('   Error:', JSON.stringify(err.response?.data, null, 2));
     }
+
+    if (productId) {
+      // ✅ Get existing images already uploaded to Shopify
+      let existingImageFilenames = [];
+      try {
+        const imgRes = await axios.get(
+          `https://${process.env.SHOPIFY_STORE}/admin/api/2026-04/products/${productId}/images.json`,
+          { headers }
+        );
+        // Extract filenames from Shopify image URLs
+        existingImageFilenames = imgRes.data.images.map(img => {
+          const parts = img.src.split('/');
+          // Remove query params from filename
+          return parts[parts.length - 1].split('?')[0];
+        });
+        console.log(`   🖼️ Existing images: ${existingImageFilenames.join(', ') || 'none'}`);
+      } catch (err) {
+        console.error('   ⚠️ Could not fetch existing images:', err.message);
+      }
+
+      // ✅ Upload main image — skip if already exists
+      if (item.EXTFILENAME) {
+        const mainFilename = `${item.PARTNAME}.jpg`;
+        if (existingImageFilenames.includes(mainFilename)) {
+          console.log(`   ⏭️ Main image already exists, skipping: ${mainFilename}`);
+        } else {
+          console.log(`   🖼️ Uploading main image: ${mainFilename}`);
+          await uploadBase64ImageToShopify(token, item.EXTFILENAME, mainFilename, productId);
+        }
+      } else {
+        console.log(`   ⚠️ No main image found`);
+      }
+
+      // ✅ Upload additional images — skip if already exists
+      const additionalImages = item.PARTEXTFILE_SUBFORM || [];
+      if (additionalImages.length > 0) {
+        console.log(`   🖼️ Processing ${additionalImages.length} additional images...`);
+        for (let i = 0; i < additionalImages.length; i++) {
+          const file = additionalImages[i];
+          if (file.EXTFILENAME) {
+            const ext = file.SUFFIX || 'jpg';
+            const filename = `${item.PARTNAME}_${file.EXTFILEDES}.${ext}`;
+            if (existingImageFilenames.includes(filename)) {
+              console.log(`   ⏭️ Image already exists, skipping: ${filename}`);
+            } else {
+              console.log(`   🖼️ Uploading additional image ${i + 1}: ${filename}`);
+              await uploadBase64ImageToShopify(token, file.EXTFILENAME, filename, productId);
+              await new Promise(r => setTimeout(r, 300));
+            }
+          }
+        }
+      } else {
+        console.log(`   ⚠️ No additional images found`);
+      }
+    }
+
+    await new Promise(r => setTimeout(r, 500));
   }
+
+  console.log('\n✅ Sync complete!');
 }
 
-
-// ============================================
-// MAIN - Run the sync
-// ============================================
 async function main() {
   try {
     console.log('🔑 Getting Shopify token...');
