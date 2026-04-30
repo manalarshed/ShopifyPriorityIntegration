@@ -287,13 +287,13 @@ async function main() {
   }
 }
 
-// ============================================
-// CRON - Run every hour automatically
-// ============================================
-console.log('⏰ Scheduler started - syncing every hour...');
-main();
-cron.schedule('0 * * * *', () => {
-  console.log(`🔄 Running scheduled sync at ${new Date().toLocaleString()}`);
-  main();
-});
+// // ============================================
+// // CRON - Run every hour automatically
+// // ============================================
+// console.log('⏰ Scheduler started - syncing every hour...');
+// main();
+// cron.schedule('0 * * * *', () => {
+//   console.log(`🔄 Running scheduled sync at ${new Date().toLocaleString()}`);
+//   main();
+// });
 
